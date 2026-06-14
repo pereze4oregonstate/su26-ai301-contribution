@@ -3,7 +3,7 @@
 **Contribution Number:** 1
 **Student:** Eduardo Perez
 **Issue:** https://github.com/pipecat-ai/pipecat/issues/1015
-**Status:** Phase II Complete
+**Status:** Phase III Complete
 
 ## Why I Chose This Issue
 
@@ -201,29 +201,50 @@ UI (maintainer's explicit request), full `uv run pytest` and ruff checks.
 
 ### Unit Tests
 
-(All using `run_test()` with mocked Polly responses, the scope the maintainer
-approved, so no live AWS credentials are needed in CI.)
+The four cases planned in Phase II were implemented and expanded into 8 concrete
+unit tests in `tests/test_aws_tts.py`, all using a mocked aiobotocore Polly client
+(no live AWS in CI), modeled on `tests/test_smallest_tts.py`:
 
-- Test case 1: a single sentence produces one `TTSTextFrame` per word with
-  monotonically increasing `pts`.
-- Test case 2: multiple sentences within one turn produce cumulative timestamps
-  (second sentence's words offset by the first sentence's audio duration).
-- Test case 3: SpeechMarks returning empty/no data triggers the fallback whole-text
-  `TTSTextFrame` (assistant context still recorded).
-- Test case 4: interruption resets `_cumulative_time` so the next turn's
-  timestamps start from zero.
+1. Constructor wiring, enabled: `word_timestamps=True` passes
+   `push_text_frames=False` to the base class.
+2. Constructor wiring, disabled: `word_timestamps=False` passes
+   `push_text_frames=True`.
+3. SpeechMarks parsing: NDJSON response parses into `(word, start_seconds)` pairs.
+4. Marks-call failure returns an empty list rather than raising.
+5. Cumulative offset: a second sentence in the same turn is offset by the first
+   sentence's audio duration, so `pts` values stay monotonic.
+6. No-marks fallback: an empty marks response triggers one whole-text
+   `TTSTextFrame` so assistant context is still recorded.
+7. Disabled path: `word_timestamps=False` skips the SpeechMarks call entirely.
+8. Offset reset: a `TTSStoppedFrame` resets `_cumulative_time` to zero for the next
+   turn.
+
+All 8 pass under `uv run pytest tests/test_aws_tts.py`.
 
 ### Integration Tests
 
-- Live (local, not CI): reproduction script re-run on the fixed branch flips the
-  gap analysis to per-word timestamped frames ≥ word count.
+- Live (local, not CI): the reproduction script re-run on the fixed branch flips the
+  gap analysis. The same 9-word sentence now yields 9 `TTSTextFrame`s, each with
+  `pts` set and monotonically increasing (850000000 → 3258000000 ns), versus the
+  single untimed frame before the fix.
 - Full repo test suite (`uv run pytest`) passes with no regressions.
 
 ### Manual Testing
 
-- Pipecat Prebuilt UI session with live AWS credentials to visually confirm
-  audio/word alignment (the maintainer's requested verification).
-- Result: pending Phase III implementation.
+- Pipecat Prebuilt UI session (SmallWebRTC transport, Karaoke caption view) with
+  live AWS credentials, to visually confirm audio/word alignment (the maintainer's
+  requested verification).
+- Because no Deepgram or OpenAI keys were available locally, the full STT + LLM
+  voice agent (`06-voice-agent.py`) could not run, so I drove the same word-timestamp
+  caption path with a small TTS-only bot: a copy of the canonical
+  `01-say-one-thing.py` with Cartesia swapped for `AWSPollyTTSService`
+  (`word_timestamps` enabled), speaking a fixed multi-sentence utterance on connect.
+  The caption path exercised is identical; the only difference is a fixed utterance
+  instead of live conversation.
+- **Result (passed):** with the multi-sentence Polly utterance, words highlighted in
+  time with the audio and stayed correctly ordered across sentence boundaries.
+  Interruption and offset reset are not directly testable in a speak-only bot, but
+  are covered by unit test 8.
 
 ## Implementation Notes
 
@@ -244,27 +265,94 @@ approved, so no live AWS credentials are needed in CI.)
   issue's outdated `PollyTTSService` name; mocked tests for CI per
   maintainer-approved scope; concurrent SpeechMarks call to protect TTFB.
 
+### Week 3 Progress
+
+**What I built (all in `src/pipecat/services/aws/tts.py`):**
+
+- Added a `word_timestamps: bool = True` constructor flag and passed
+  `push_text_frames=not word_timestamps` to the base `TTSService`, so the per-word
+  path activates by default and callers can opt out to skip the extra Polly call.
+  Initialized `self._cumulative_time = 0.0`.
+- Added `start()` and `push_frame()` overrides that reset `_cumulative_time` on
+  start and on `InterruptionFrame` / `TTSStoppedFrame`, so per-turn timing always
+  starts from zero.
+- Added `_fetch_word_marks()`: a second, concurrent `synthesize_speech` call with
+  `OutputFormat="json"` and `SpeechMarkTypes=["word"]`, parsing the newline-delimited
+  JSON into `(word, start_seconds)` pairs and returning `[]` on any failure.
+- Added `_push_fallback_text()`: the Inworld-style whole-text `TTSTextFrame` fallback
+  for when no marks come back.
+- Reworked `run_tts()`: the marks call is scheduled concurrently with the audio call
+  (via a scheduled task) so time-to-first-byte is unaffected; utterance duration is
+  derived from the PCM byte length (`len(pcm) / (16000 * 2)`) since Polly marks carry
+  only start times; word times are fed to `add_word_timestamps()` with the cumulative
+  offset; the fallback fires when no marks are present; and the pending marks task is
+  cancelled in a `finally` block.
+- Added 8 mocked unit tests in `tests/test_aws_tts.py` (see Testing Strategy).
+- Added the changelog fragment `changelog/4730.added.md` per CONTRIBUTING.md.
+
+**Validation:**
+
+- `ruff check` and `ruff format` pass; `AWSPollyTTSService` imports cleanly.
+- Reproduction script re-run on the branch: 9 words now produce 9 timestamped
+  `TTSTextFrame`s with monotonic `pts` (gap fixed).
+- All 8 unit tests pass.
+- `towncrier build --draft` renders the changelog entry correctly.
+- Manual Prebuilt UI alignment check passed (see Manual Testing).
+
+**Challenges faced this week:**
+
+- The `pipecat-cli-registry-imports` pre-commit hook crashed on Windows with a
+  `UnicodeEncodeError` (cp1252 console could not print an emoji in the hook output).
+  Fixed by setting `$env:PYTHONUTF8 = "1"` in the shell before committing; needs to
+  be set once per fresh PowerShell session.
+- The `towncrier --draft` preview rendered empty at first. Cause was mundane: the
+  changelog file was still unsaved in the editor. Saving it fixed the render.
+- The Prebuilt server failed to bind port 7860 on a re-run because an earlier bot
+  process was still holding it. Freed the listener
+  (`Get-NetTCPConnection -LocalPort 7860 ...`) and re-ran.
+- The full voice agent crashed immediately with `KeyError: 'DEEPGRAM_API_KEY'`.
+  Interrogating the repo showed there is no `.env` at all (AWS works because it reads
+  the `aws configure` profile, not `.env`), and I had no Deepgram or OpenAI keys. A
+  paid ChatGPT subscription does not grant OpenAI API access, so I pivoted to the
+  TTS-only Polly bot for the alignment check.
+
 ### Code Changes
 
-- Files modified: (Phase III) `src/pipecat/services/aws/tts.py`,
-  `changelog/<PR>.added.md`, new test file
-- Key commits: pending Phase III.
+- Files changed (committed to the PR):
+  - `src/pipecat/services/aws/tts.py` — the implementation.
+  - `tests/test_aws_tts.py` — the 8 mocked unit tests.
+  - `changelog/4730.added.md` — the changelog fragment.
+- Scratch files deliberately kept out of the fork (added to `.git/info/exclude`):
+  the reproduction script, the design/summary notes, and the two throwaway Prebuilt
+  test bots under `examples/getting-started/`.
+- Key commits:
+  - `8887017` — Add word timestamps to AWSPollyTTSService via Polly SpeechMarks
+    (implementation + tests).
+  - `b3d52c1` — Add changelog fragment for #4730.
 - Approach decisions: follow `InworldHttpTTSService` pattern; use base `TTSService`
-  machinery only (no base-class changes); `asyncio.gather` for the dual Polly
-  calls.
+  machinery only (no base-class changes); run the dual Polly calls concurrently to
+  protect TTFB; explicit no-marks fallback so assistant context is preserved even
+  when SpeechMarks fails.
 
 ## Pull Request
 
-**PR Link:** Not yet submitted (Phase IV).
-**PR Description:** Will be drafted in Phase IV, adapted from the Solution Approach
-and Testing Strategy sections above.
+**PR Link:** https://github.com/pipecat-ai/pipecat/pull/4730 (open, marked ready for
+review)
+**PR Description:** Submitted with the PR, with Summary / Approach / Testing / Notes
+sections adapted from the Solution Approach and Testing Strategy above. The PR is
+cross-fork (`perez-eduardo:add-aws-tts-word-timestamps-1015` → `pipecat-ai:main`),
+2 commits, and reports as mergeable. CI workflows are awaiting maintainer approval
+(standard for an external contributor); the Read the Docs build passed.
 **Maintainer Feedback:**
 
 - 2026-06 (pre-work, on issue #1015): markbackman approved the proposed scope;
   asked to confirm audio/word alignment via Pipecat Prebuilt and to follow existing
-  TTS provider patterns and base TTSService class methods.
+  TTS provider patterns and base TTSService class methods. Both addressed.
+- After opening the PR, I left a comment on issue #1015 tagging markbackman,
+  summarizing the approach and the Prebuilt alignment result. Awaiting review.
 
-**Status:** Phase II Complete — ready to begin Phase III (Build)
+**Status:** Phase III Complete. PR opened and marked ready for review; now entering
+Phase IV (respond to maintainer feedback and iterate).
 
 ## Learnings & Reflections
 
@@ -278,6 +366,9 @@ SpeechMarks API and its constraint that audio and timing require separate reques
 Using Pipecat's `run_test()` harness as a precise reproduction instrument rather
 than relying on manual observation. Using Claude Code for read-only codebase
 analysis to find root causes and reference patterns before writing any code.
+Running and validating a live voice pipeline through the Pipecat Prebuilt
+(SmallWebRTC) UI, and reducing a verification to the minimum bot that still
+exercises the path under test.
 
 ### Challenges Overcome
 
@@ -287,19 +378,24 @@ transitively; solving this required understanding how uv resolves extras and
 switching to a targeted install. The issue text itself was a moving target: both
 class names it references (`WordTTSService`, `PollyTTSService`) no longer exist, so
 I had to verify the current state of the code instead of trusting the issue or even
-the changelog. Finally, I accidentally exposed an AWS access key while sharing
-terminal output and had to immediately deactivate, delete, and rotate it; a
-concrete lesson in treating any pasted secret as compromised and never sharing
-`aws configure` output.
+the changelog. During the build, a Windows-only pre-commit encoding crash and a
+port-binding collision both had to be diagnosed and worked around, and the
+Prebuilt verification had to be re-planned around missing third-party API keys by
+swapping in a TTS-only bot that still drives the exact caption path. Finally, I
+accidentally exposed an AWS access key while sharing terminal output and had to
+immediately deactivate, delete, and rotate it; a concrete lesson in treating any
+pasted secret as compromised and never sharing `aws configure` output.
 
 ### What I'd Do Differently Next Time
 
 Interrogate the live codebase before forming a plan, not after. My first
 assumptions (the class name, and that Google/OpenAI HTTP TTS would be the reference
 pattern) were both wrong, and verifying against the actual code corrected the plan
-early instead of mid-implementation. I'd also handle credentials more carefully
-from the start: create a narrowly-scoped IAM user for the project and sanitize
-terminal output before sharing it anywhere.
+early instead of mid-implementation. I'd also confirm the runtime prerequisites for
+my verification environment up front: knowing earlier that the Prebuilt voice agent
+needs Deepgram and OpenAI keys would have let me plan the TTS-only check from the
+start. And I'd handle credentials more carefully: a narrowly-scoped IAM user for the
+project and sanitized terminal output before sharing it anywhere.
 
 ## Resources Used
 
