@@ -5,15 +5,72 @@
 **Issue:** https://github.com/pipecat-ai/pipecat/issues/1015
 **Status:** Phase III Complete
 
+## Problem Summary
+
+Pipecat's Amazon Polly text-to-speech service produces audio but attaches no
+per-word timing, so anything that needs to know when each word is spoken (live
+captions, RTVI bot-output events, accurate assistant context) gets nothing from it.
+Timestamp-capable services like `ElevenLabsTTSService` already emit one timed
+`TTSTextFrame` per word, and Amazon Polly exposes the same data through its
+SpeechMarks feature, but the Pipecat service never requests it. This matters because
+word timing is what powers synchronized captions and UI state in a real-time voice
+agent, and Polly users are the only ones who miss out. I chose it because it sits
+squarely in Pipecat's real-time voice domain, gives me hands-on AWS experience, and
+is well-scoped for a first contribution: one service file plus tests, with a
+maintainer's approval on the plan.
+
 ## Why I Chose This Issue
 
-This issue combines real-time voice AI (Pipecat's core domain) with AWS services I
-want more hands-on experience with. It is labeled `help wanted`, the maintainers
-explicitly welcomed a community PR, and a maintainer (markbackman) approved my
-proposed scope, which gave me confidence it is well-scoped for a first contribution.
-The work touches an interesting architectural challenge: the existing word-timestamp
-implementations are mostly websocket-based, while Polly is HTTP-based and requires a
-separate API call for timing data.
+**Skill match.** I have working Python experience and hands-on familiarity with AWS,
+and I am comfortable reading unfamiliar codebases and writing mocked unit tests. This
+issue plays to those strengths: it is a focused change in a Python service that talks
+to an AWS API, verifiable with tests that mock the AWS response.
+
+**Learning goal.** I wanted deeper, practical experience with real-time voice AI,
+which is Pipecat's core domain, and with a production TTS integration. I also wanted
+practice matching an existing project's patterns, style, and testing conventions
+rather than inventing my own, which is the skill this whole course is built around.
+
+**Understanding.** I understood from the issue and the code that the gap is specific
+and tractable. Polly already exposes word timing through SpeechMarks, and Pipecat's
+base `TTSService` already contains the machinery to emit per-word timestamps, so the
+work is to connect the two by following an existing HTTP-based provider as a
+template. The architectural wrinkle that makes it interesting is that Polly is
+HTTP-based and returns audio and timing in separate requests, unlike the websocket
+providers, so the timing has to be fetched with a second, concurrent call.
+
+## Issue Selection and Scope
+
+### Issue Link and Claimability
+
+- Issue: https://github.com/pipecat-ai/pipecat/issues/1015
+- When I selected and claimed this issue in Week 1, it was open, unassigned, labeled
+  `help wanted`, and had no open or linked pull request. It is now being addressed by
+  my own pull request, [#4730](https://github.com/pipecat-ai/pipecat/pull/4730).
+
+### Project Health and Setup Docs
+
+- Pipecat is an actively maintained project with frequent commits, tagged releases,
+  and responsive maintainers. A maintainer replied to my scope question within a few
+  days.
+- It ships the contributor documentation I relied on: a `CONTRIBUTING.md` (changelog
+  fragments, docstring and lint conventions) and an `AGENTS.md` (dev commands,
+  architecture, test utilities), plus a documented `uv`-based development setup.
+
+### Scope
+
+- The change is contained: one service file (`src/pipecat/services/aws/tts.py`) plus
+  a new test file and a changelog fragment, with no changes to shared base classes.
+  Maintainer markbackman confirmed this scope is appropriate for a first
+  contribution.
+
+### My Introduction on the Issue
+
+- Before starting, I introduced myself on the issue, proposed my scope, and asked for
+  confirmation:
+  [intro comment](https://github.com/pipecat-ai/pipecat/issues/1015#issuecomment-4617134833).
+  It was posted under my prior GitHub handle `pereze4oregonstate`, which I am
+  transitioning to `perez-eduardo`.
 
 ## Understanding the Issue
 
@@ -51,6 +108,29 @@ The service emits the audio frames plus a single whole-sentence `TTSTextFrame` w
   machinery (`add_word_timestamps()`), used but not modified
 - Reference implementation: `src/pipecat/services/inworld/tts.py`
   (`InworldHttpTTSService`)
+
+### Acceptance Criteria (what "fixed" looks like)
+
+- Synthesizing a sentence emits one `TTSTextFrame` per word, each with a `pts` set
+  rather than `None`.
+- Timestamps increase monotonically within a turn and stay correctly ordered across
+  multiple sentences in the same turn.
+- Interruption or stop resets the timing so the next turn starts from zero.
+- When Polly returns no marks, the service still emits the spoken text so assistant
+  context is preserved.
+- The feature can be turned off to skip the extra Polly request.
+- The above is covered by tests that mock the Polly client (no live AWS in CI), and
+  the existing test suite still passes.
+
+### Maintainer Guidance and Related Comments
+
+- ballagas opened the request (Jan 2025): add ElevenLabs-style word timing to the
+  Polly service.
+- chadbailey59 flagged the HTTP-versus-websocket wrinkle and welcomed a community PR:
+  [comment](https://github.com/pipecat-ai/pipecat/issues/1015#issuecomment-2603046000).
+- markbackman approved my proposed scope and asked me to confirm audio and word
+  alignment in the Pipecat Prebuilt and to reuse the base `TTSService` methods:
+  [comment](https://github.com/pipecat-ai/pipecat/issues/1015#issuecomment-4623461213).
 
 ## Reproduction Process
 
